@@ -1,0 +1,28 @@
+{
+    "name": "mcp-prodago",
+    "version": "2.1.0",
+    "description": "MCP Server + AI Foundry Agent for Prodago Governance",
+    "scripts": {
+        "build": "tsc",
+        "watch": "tsc -w",
+        "clean": "rimraf dist",
+        "prestart": "npm run clean && npm run build",
+        "start": "func start",
+        "deploy": "func azure functionapp publish mcp-prodago --typescript",
+        "deploy:agent": "npx ts-node src/create-agent.ts",
+        "deploy:infra": "az deployment group create --resource-group rg-agent-prodago-ai2 --template-file infra/main.bicep --parameters infra/main.bicepparam",
+        "deploy:infra:preview": "az deployment group what-if --resource-group rg-agent-prodago-ai2 --template-file infra/main.bicep --parameters infra/main.bicepparam",
+        "deploy:all": "npm run deploy:infra && npm run deploy && npm run deploy:agent",
+        "test": "echo \"No tests yet...\""
+    },
+    "dependencies": {
+        "@azure/functions": "^4.9.0",
+        "@azure/identity": "^4.9.1"
+    },
+    "devDependencies": {
+        "@types/node": "^20.x",
+        "rimraf": "^5.0.0",
+        "typescript": "^5.0.0"
+    },
+    "main": "dist/src/{index.js,functions/*.js}"
+}

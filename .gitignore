@@ -1,0 +1,11 @@
+node_modules/
+dist/
+local.settings.json
+.funcignore
+inspect-output.txt
+*.bicepparam
+.context.md
+endpoints.txt
+endpoints_utf8.txt
+.env
+.env.*
