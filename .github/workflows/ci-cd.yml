@@ -55,13 +55,9 @@ jobs:
       - name: Install production dependencies
         run: npm ci --omit=dev
 
-      - name: Login to Azure
-        uses: Azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
       - name: Deploy to Azure Function App
         uses: Azure/functions-action@v1
         with:
           app-name: mcp-prodago
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
           package: .
