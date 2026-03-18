@@ -1,10 +1,25 @@
 import { app, InvocationContext, arg } from "@azure/functions";
-import { fetchProdagoAPI, extractUserToken } from "../shared/prodagoApi";
+import {
+    fetchProdagoAPI,
+    extractUserToken,
+    switchTenant,
+    getActiveTenant,
+    debugAuth,
+} from "../shared/prodagoApi";
 
 /**
- * Single MCP tool that routes to all Prodago API endpoints via an `action` parameter.
- * Auth flow: Foundry Agent passes user Entra token → extracted from transport.headers
- * → exchanged with saas.prodago.com → Prodago bearer + preferred-tenant cached 50min
+ * Single MCP tool that routes all Prodago API actions transparently.
+ *
+ * ── Auth flow (fully transparent to the user) ──────────────────────────────
+ * 1. User authenticates to Azure Foundry with their Entra account.
+ * 2. Foundry forwards the Entra Bearer token to this MCP server via OAuth
+ *    passthrough (project_connection_id on the MCP tool definition).
+ * 3. On every call, the token is extracted from the MCP transport headers.
+ * 4. getProdagoCredentials() exchanges it for a Prodago token + preferred-tenant
+ *    from https://saas.prodago.com/user (result cached 50 min).
+ * 5. All API calls are made with the Prodago token + preferred-tenant header.
+ * 6. The user can list their tenants with get_user_tenants and switch context
+ *    with set_preferred_tenant — no manual token handling required.
  */
 app.mcpTool("prodago_api", {
     toolName: "prodago_api",
@@ -58,7 +73,9 @@ DATA & RISKS:
 - get_homepage — Homepage summary data
 
 TENANT & USER:
-- get_user_tenants — Current user's tenants
+- get_user_tenants — List all tenants available for the current user
+- get_active_tenant — Show the currently active tenant context
+- set_preferred_tenant(tenant_name) — Switch the active tenant for this session
 - get_tenant_metadata — Tenant configuration metadata
 - get_users — List tenant users
 
@@ -68,49 +85,75 @@ ENFORCEMENT:
 
 OTHER:
 - get_questionnaire(project_id) — Project questionnaire
-- debug_auth — Diagnose authentication issues`,
+- debug_auth — Diagnose authentication issues (admin use)`,
 
     toolProperties: {
-        action: arg.string().describe("The action to perform (e.g. get_projects, get_activities, get_compliance_objects, etc.)"),
-        project_id: arg.string().optional().describe("Project GUID — required for project-specific actions"),
+        action:      arg.string().describe("The action to perform (e.g. get_projects, get_user_tenants, set_preferred_tenant, …)"),
+        project_id:  arg.string().optional().describe("Project GUID — required for project-specific actions"),
         activity_id: arg.string().optional().describe("Activity identifier — required for get_activity_details"),
-        code: arg.string().optional().describe("Compliance object or operating practice code"),
+        code:        arg.string().optional().describe("Compliance object or operating practice code"),
         artefact_id: arg.string().optional().describe("Artefact identifier — required for get_artefact_details"),
+        tenant_name: arg.string().optional().describe("Tenant name — required for set_preferred_tenant"),
     },
 
     handler: async (toolArguments: unknown, context: InvocationContext): Promise<string> => {
-        const meta = context.triggerMetadata as Record<string, any> || {};
-        const args = (meta.mcptoolargs as Record<string, string>) || {};
+        const meta = (context.triggerMetadata as Record<string, any>) ?? {};
+        const args = (meta.mcptoolargs as Record<string, string>) ?? {};
 
-        const action = args.action;
-        const project_id = args.project_id;
+        const action      = args.action;
+        const project_id  = args.project_id;
         const activity_id = args.activity_id;
-        const code = args.code;
+        const code        = args.code;
         const artefact_id = args.artefact_id;
+        const tenant_name = args.tenant_name;
 
         if (!action) {
             return JSON.stringify({ error: "Missing required parameter: action" });
         }
 
-        // Extract the user's Entra token (passed by Foundry Agent via OAuth passthrough)
-        const userToken = extractUserToken(meta, toolArguments);
+        // ── Extract the user's Entra token (injected by Foundry OAuth passthrough) ──
+        const entraToken = extractUserToken(meta, toolArguments);
 
-        // ── Debug action ──────────────────────────────────────────────
+        // ── Non-API actions ────────────────────────────────────────────────────────
+
         if (action === "debug_auth") {
-            const { debugAuth } = await import("../shared/prodagoApi");
-            const result = await debugAuth(userToken);
-            // Include diagnostics about where the token was found
-            const transportHeaders = (toolArguments as any)?.transport?.headers;
+            const result = await debugAuth(entraToken);
+            const transport = (toolArguments as any)?.transport;
             return JSON.stringify({
                 ...result,
-                token_found: !!userToken,
-                token_length: userToken?.length ?? 0,
-                transport_headers_keys: transportHeaders ? Object.keys(transportHeaders) : [],
-                meta_keys: Object.keys(meta),
+                entraTokenFound:    !!entraToken,
+                entraTokenLength:   entraToken?.length ?? 0,
+                transportHeaderKeys: transport?.headers ? Object.keys(transport.headers) : [],
+                metaKeys:           Object.keys(meta),
             }, null, 2);
         }
 
-        // ── Route to appropriate endpoint ──────────────────────────────
+        if (action === "get_active_tenant") {
+            const tenant = entraToken ? getActiveTenant(entraToken) : null;
+            return JSON.stringify({
+                active_tenant: tenant ?? "NONE",
+                note: tenant
+                    ? "This tenant is sent as the 'preferred-tenant' header on all API calls."
+                    : "No tenant is set. Use get_user_tenants to list available tenants, then set_preferred_tenant to choose one.",
+            });
+        }
+
+        if (action === "set_preferred_tenant") {
+            if (!tenant_name) {
+                return JSON.stringify({ error: "tenant_name is required for set_preferred_tenant" });
+            }
+            if (!entraToken) {
+                return JSON.stringify({ error: "No authenticated session found. Please reconnect to Foundry." });
+            }
+            const newTenant = switchTenant(entraToken, tenant_name);
+            return JSON.stringify({
+                success: true,
+                active_tenant: newTenant,
+                message: `Tenant switched to "${newTenant}". All subsequent API calls will use this tenant.`,
+            });
+        }
+
+        // ── API-backed actions ─────────────────────────────────────────────────────
         try {
             let path: string;
             let method: "GET" | "POST" | "PUT" = "GET";
@@ -118,7 +161,7 @@ OTHER:
 
             switch (action) {
                 // Projects
-                case "get_projects": path = "/projects"; break;
+                case "get_projects":       path = "/projects"; break;
                 case "get_recent_projects": path = "/Projects/recent"; break;
                 case "get_project_details":
                     if (!project_id) return JSON.stringify({ error: "project_id is required for get_project_details" });
@@ -169,8 +212,8 @@ OTHER:
                     path = `/ComplianceObject/${code}/projects`; break;
 
                 // Derogations
-                case "get_derogations": path = "/Derogation"; break;
-                case "get_derogations_v2": path = "/Derogation/v2"; break;
+                case "get_derogations":             path = "/Derogation"; break;
+                case "get_derogations_v2":          path = "/Derogation/v2"; break;
                 case "get_derogation_reason_types": path = "/Derogation/reasonTypes"; break;
 
                 // Artefacts
@@ -193,15 +236,15 @@ OTHER:
                     path = `/OperatingPractice/${code}/hierarchy`; break;
 
                 // Data & risks
-                case "get_data_risks": path = "/DataRisk"; break;
-                case "get_heatmap": path = "/HeatMap"; break;
+                case "get_data_risks":  path = "/DataRisk"; break;
+                case "get_heatmap":     path = "/HeatMap"; break;
                 case "get_trust_level": path = "/TrustLevel"; break;
-                case "get_homepage": path = "/HomePage"; break;
+                case "get_homepage":    path = "/HomePage"; break;
 
                 // Tenant & users
-                case "get_user_tenants": path = "/User/userTenants"; break;
+                case "get_user_tenants":    path = "/User/userTenants"; break;
                 case "get_tenant_metadata": path = "/Tenant/metadata"; break;
-                case "get_users": path = "/User"; break;
+                case "get_users":           path = "/User"; break;
 
                 // Enforcement
                 case "get_enforcement_projects": path = "/Enforcement/projects"; break;
@@ -217,18 +260,23 @@ OTHER:
                 default:
                     return JSON.stringify({
                         error: `Unknown action: "${action}"`,
-                        hint: "Use debug_auth to test authentication, or get_projects to list projects.",
+                        hint: "Use get_user_tenants to list tenants, set_preferred_tenant to switch, or debug_auth to diagnose auth issues.",
                     });
             }
 
-            const result = await fetchProdagoAPI<any>(path, userToken, method === "GET" ? undefined : { method, body });
+            const result = await fetchProdagoAPI<any>(
+                path,
+                entraToken,
+                method !== "GET" ? { method, body } : undefined,
+            );
             return JSON.stringify(result ?? { success: true });
 
         } catch (error: any) {
             return JSON.stringify({
-                error: error.message,
+                error:          error.message,
                 action,
-                token_found: !!userToken,
+                entraTokenFound: !!entraToken,
+                hint:           "If you see a 401 error, your session may have expired — try again or reconnect to Foundry.",
             });
         }
     },

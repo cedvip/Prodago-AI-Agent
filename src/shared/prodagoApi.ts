@@ -1,474 +1,347 @@
 /**
  * Shared Prodago API client for MCP tool handlers.
- * 
- * Token acquisition strategy (user pass-through):
- * 1. The Foundry Agent forwards the user's Entra ID token to the MCP server
- * 2. The MCP handler extracts it from triggerMetadata / request headers
- * 3. We call saas.prodago.com with the user's Entra token
- * 4. saas.prodago.com returns:
- *    - Authorization header → the Prodago bearer token
- *    - preferred-tenant header → the tenant context for API calls
- * 5. We cache BOTH and use them for all Prodago API calls
- * 
- * Fallback: if PRODAGO_API_TOKEN is set, use it directly (dev/testing).
+ *
+ * ── Token flow (fully transparent to the user) ─────────────────────────────
+ * 1. Azure Foundry agent connects with a user Entra ID account.
+ * 2. On every MCP tool call, Foundry forwards the user's Entra Bearer token
+ *    via the HTTP Authorization header of the MCP transport.
+ * 3. extractUserToken() pulls it from triggerMetadata / transport headers.
+ * 4. getProdagoCredentials() calls https://saas.prodago.com/user with that
+ *    Entra token and receives:
+ *      - Authorization response header → Prodago bearer token
+ *      - preferred-tenant response header → default tenant for this user
+ * 5. Both are cached for 50 min (per Entra-token fingerprint).
+ * 6. switchTenant() lets the user override the cached preferred-tenant for
+ *    their session without re-exchanging the full token.
+ * 7. fetchProdagoAPI() attaches the Prodago token + preferred-tenant to every
+ *    downstream API call automatically.
+ *
+ * Fallback: if PRODAGO_API_TOKEN env var is set it is used directly (dev/CI).
  */
 
-const API_URL = process.env.PRODAGO_API_URL || "https://prodago-api-prod2.azurewebsites.net/api";
-const SAAS_URL = process.env.PRODAGO_SAAS_URL || "https://saas.prodago.com/";
+const API_URL  = process.env.PRODAGO_API_URL  || "https://prodago-api-prod2.azurewebsites.net/api";
+const SAAS_URL = process.env.PRODAGO_SAAS_URL || "https://saas.prodago.com/user";
 const STATIC_TOKEN = process.env.PRODAGO_API_TOKEN;
 
-// ── Per-user credentials cache ───────────────────────────────
-// Maps user Entra token hash → { prodagoToken, preferredTenant, expiry }
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export interface FetchOptions {
+    method?: "GET" | "POST" | "PUT" | "DELETE";
+    body?: unknown;
+}
+
 interface CachedCredentials {
-    token: string;
+    /** Prodago bearer token returned by saas.prodago.com */
+    prodagoToken: string;
+    /** Default tenant from saas.prodago.com — may be overridden by switchTenant() */
     preferredTenant: string | null;
+    /** ISO timestamp when the token expires (50 min from exchange) */
     expiry: number;
 }
-const credentialsCache = new Map<string, CachedCredentials>();
-const TOKEN_CACHE_DURATION_MS = 50 * 60 * 1000; // 50 minutes
 
+// ── In-process caches ─────────────────────────────────────────────────────────
+
+/** Maps Entra-token fingerprint → Prodago credentials */
+const credentialsCache = new Map<string, CachedCredentials>();
 
 /**
- * Simple hash for cache key (avoids storing full Entra tokens as keys)
+ * Per-user tenant override.
+ * Maps Entra-token fingerprint → tenant name chosen via set_preferred_tenant.
+ * Cleared automatically if the credentials expire.
  */
-function hashToken(token: string): string {
-    // Use last 32 chars of the token as a simple cache key
-    return token.slice(-32);
+const tenantOverride = new Map<string, string>();
+
+const TOKEN_CACHE_MS = 50 * 60 * 1_000; // 50 minutes
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Lightweight fingerprint for cache keys — avoids storing full JWT strings. */
+function fingerprint(token: string): string {
+    return token.slice(-40);
 }
 
-/**
- * Exchanges a user's Entra ID token for Prodago API credentials.
- *
- * The call to saas.prodago.com returns THREE things:
- *   1. Authorization response header → Prodago bearer token
- *   2. preferred-tenant response header → default tenant name
- *   3. Response body → list of available tenants (userTenants)
- *
- * We do two fetches:
- *   - redirect: "manual" → captures Authorization from the 302 response
- *   - redirect: "follow" → captures preferred-tenant header + body from final response
- */
-async function exchangeForProdagoCredentials(userEntraToken: string): Promise<CachedCredentials> {
-    const cacheKey = hashToken(userEntraToken);
+// ── Core: exchange Entra token → Prodago credentials ─────────────────────────
 
-    // Check cache first
-    const cached = credentialsCache.get(cacheKey);
+/**
+ * Calls https://saas.prodago.com/user with the user's Entra Bearer token and
+ * returns the Prodago token + preferred-tenant, using a 50-min in-process cache.
+ *
+ * saas.prodago.com returns:
+ *   - Authorization header  → Prodago bearer token
+ *   - preferred-tenant header → default tenant name
+ *   - Body                  → list of user tenants (parsed as fallback)
+ *
+ * Two fetches are used:
+ *   1. redirect: "manual"  → captures the Authorization from the 3xx Location
+ *   2. redirect: "follow"  → follows to the final page to get preferred-tenant + body
+ */
+async function exchangeForProdagoCredentials(entraToken: string): Promise<CachedCredentials> {
+    const key = fingerprint(entraToken);
+
+    // Return cached credentials if still valid
+    const cached = credentialsCache.get(key);
     if (cached && Date.now() < cached.expiry) {
         return cached;
     }
 
-    console.log("[TokenManager] Exchanging user Entra token via", SAAS_URL);
+    console.log("[TokenManager] Exchanging Entra token via", SAAS_URL);
 
-    // ── Fetch 1: redirect=manual → get Authorization header from 302 ──
-    const redirectRes = await fetch(SAAS_URL, {
+    const commonHeaders = {
+        "Authorization": `Bearer ${entraToken}`,
+        "Accept": "application/json",
+    };
+
+    // ── Fetch 1: manual redirect → grab Authorization from 3xx response ───────
+    const manualRes = await fetch(SAAS_URL, {
         method: "GET",
-        headers: {
-            "Authorization": `Bearer ${userEntraToken}`,
-            "Accept": "application/json",
-        },
+        headers: commonHeaders,
         redirect: "manual",
     });
+    console.log(`[TokenManager] Fetch1 (manual) status: ${manualRes.status}`);
 
-    console.log(`[TokenManager] Fetch1 (manual) status: ${redirectRes.status}`);
+    let authHeader = manualRes.headers.get("Authorization");
+    let preferredTenant: string | null = manualRes.headers.get("preferred-tenant");
 
-    const authHeader = redirectRes.headers.get("Authorization");
-
-    // Also try to get preferred-tenant from the 302 (might be here or on final)
-    let preferredTenant: string | null = redirectRes.headers.get("preferred-tenant");
-    if (preferredTenant) {
-        console.log(`[TokenManager] Got preferred-tenant from 302: ${preferredTenant}`);
-    }
-
-    // ── Fetch 2: redirect=follow → get preferred-tenant header + body ──
-    console.log("[TokenManager] Fetch2 (follow redirect) to get tenant + body...");
+    // ── Fetch 2: follow redirect → grab preferred-tenant + body ──────────────
     const followRes = await fetch(SAAS_URL, {
         method: "GET",
-        headers: {
-            "Authorization": `Bearer ${userEntraToken}`,
-            "Accept": "application/json",
-        },
-        // Default: follow redirects
+        headers: commonHeaders,
+        // default: follow redirects
     });
-
     console.log(`[TokenManager] Fetch2 (follow) status: ${followRes.status}`);
 
-    // Log ALL headers from the followed response
-    const followHeaders: Record<string, string> = {};
-    followRes.headers.forEach((value, key) => {
-        followHeaders[key] = key.toLowerCase().includes('auth')
-            ? `${value.substring(0, 30)}...(len:${value.length})`
-            : value;
-    });
-    console.log(`[TokenManager] Fetch2 headers: ${JSON.stringify(followHeaders)}`);
-
-    // Get preferred-tenant from followed response if not already found
+    if (!authHeader) {
+        authHeader = followRes.headers.get("Authorization");
+    }
     if (!preferredTenant) {
         preferredTenant = followRes.headers.get("preferred-tenant");
-        if (preferredTenant) {
-            console.log(`[TokenManager] Got preferred-tenant from followed response: ${preferredTenant}`);
-        }
     }
 
-    // Get Authorization from followed response if not from 302
-    const followAuthHeader = followRes.headers.get("Authorization");
-    const effectiveAuthHeader = authHeader || followAuthHeader;
-
-    if (!effectiveAuthHeader) {
-        const bodyText = await followRes.text().catch(() => '');
-        console.error("[TokenManager] No Authorization header from either fetch. Body:", bodyText.substring(0, 300));
+    if (!authHeader) {
+        const bodySnippet = await followRes.text().catch(() => "");
         throw new Error(
-            `saas.prodago.com did not return an Authorization header.`
+            `saas.prodago.com did not return an Authorization header. ` +
+            `HTTP ${followRes.status}. Body: ${bodySnippet.substring(0, 300)}`
         );
     }
 
-    const prodagoToken = effectiveAuthHeader.startsWith("Bearer ")
-        ? effectiveAuthHeader.substring(7)
-        : effectiveAuthHeader;
-    console.log(`[TokenManager] ✅ Got Prodago token (length: ${prodagoToken.length})`);
+    // Strip "Bearer " prefix if present
+    const prodagoToken = authHeader.startsWith("Bearer ")
+        ? authHeader.substring(7)
+        : authHeader;
 
-    // Parse body for userTenants list
-    const bodyText = await followRes.text();
-    console.log(`[TokenManager] Fetch2 body (first 500): ${bodyText.substring(0, 500)}`);
+    console.log(`[TokenManager] ✅ Prodago token obtained (length: ${prodagoToken.length})`);
 
-    let availableTenants: any[] = [];
-    if (bodyText) {
+    // Parse body as fallback source for preferred-tenant
+    if (!preferredTenant) {
+        const bodyText = await followRes.text().catch(() => "");
         try {
-            const bodyData = JSON.parse(bodyText);
-
-            // Extract tenants array from body
-            if (Array.isArray(bodyData)) {
-                availableTenants = bodyData;
-            } else if (bodyData?.tenants && Array.isArray(bodyData.tenants)) {
-                availableTenants = bodyData.tenants;
-            } else if (bodyData?.userTenants && Array.isArray(bodyData.userTenants)) {
-                availableTenants = bodyData.userTenants;
-            } else if (bodyData?.data && Array.isArray(bodyData.data)) {
-                availableTenants = bodyData.data;
-            }
-
-            console.log(`[TokenManager] Found ${availableTenants.length} tenants in body`);
-            if (availableTenants.length > 0) {
-                console.log(`[TokenManager] Tenants: ${availableTenants.map((t: any) => t.tenantName || t.name || t.id).join(', ')}`);
-            }
-
-            // If we still don't have a preferred-tenant, use the first one from the list
-            if (!preferredTenant && availableTenants.length > 0) {
-                preferredTenant = availableTenants[0].tenantName || availableTenants[0].name
-                    || availableTenants[0].tenantId || availableTenants[0].id;
-                console.log(`[TokenManager] Using first tenant as default: ${preferredTenant}`);
+            const data = JSON.parse(bodyText);
+            const tenants: any[] = Array.isArray(data)
+                ? data
+                : data?.tenants ?? data?.userTenants ?? data?.data ?? [];
+            if (tenants.length > 0) {
+                preferredTenant = tenants[0].tenantName ?? tenants[0].name
+                    ?? tenants[0].tenantId ?? tenants[0].id ?? null;
+                console.log(`[TokenManager] preferred-tenant resolved from body: ${preferredTenant}`);
             }
         } catch {
-            console.warn("[TokenManager] Body is not valid JSON:", bodyText.substring(0, 200));
+            /* body is not JSON, proceed without tenant */
         }
     }
 
     if (preferredTenant) {
         console.log(`[TokenManager] ✅ preferred-tenant: ${preferredTenant}`);
     } else {
-        console.error(`[TokenManager] ❌ NO preferred-tenant found!`);
+        console.warn("[TokenManager] ❌ No preferred-tenant found — API calls may fail without it.");
     }
 
-    // Cache token + tenant
     const credentials: CachedCredentials = {
-        token: prodagoToken,
+        prodagoToken,
         preferredTenant,
-        expiry: Date.now() + TOKEN_CACHE_DURATION_MS,
+        expiry: Date.now() + TOKEN_CACHE_MS,
     };
-    credentialsCache.set(cacheKey, credentials);
+    credentialsCache.set(key, credentials);
+
+    // Clear any tenant override that belonged to the previous (now-expired) token
+    tenantOverride.delete(key);
 
     return credentials;
 }
 
-
+// ── Public: tenant switching ──────────────────────────────────────────────────
 
 /**
- * Extracts the user's Entra token from the MCP trigger context.
- * 
- * The MCP extension provides the ToolInvocationContext which contains a
- * 'transport' object with HTTP headers (including the Authorization header).
- * We check multiple locations for maximum compatibility:
- *   1. toolInvocationContext.transport.headers (MCP extension path)
- *   2. triggerMetadata flat fields
- *   3. triggerMetadata.headers object
+ * Overrides the in-flight preferred-tenant for the user identified by their
+ * Entra token. The override is stored in memory for the lifetime of the
+ * cached Prodago credentials (≈ 50 min).
+ *
+ * Returns the new effective tenant name.
  */
-export function extractUserToken(triggerMetadata: Record<string, any>, toolInvocationContext?: any): string | null {
-    const authFields = [
-        'authorization', 'Authorization',
-        'x-ms-token-aad-access-token', 'X-MS-TOKEN-AAD-ACCESS-TOKEN',
-        'bearer_token', 'access_token',
+export function switchTenant(entraToken: string, tenantName: string): string {
+    const key = fingerprint(entraToken);
+    tenantOverride.set(key, tenantName);
+    console.log(`[TokenManager] preferred-tenant switched to: ${tenantName}`);
+    return tenantName;
+}
+
+/**
+ * Returns the currently active preferred-tenant for the user.
+ * Checks the in-memory override first, then the cached credentials.
+ * Returns null if no Prodago credentials have been exchanged yet.
+ */
+export function getActiveTenant(entraToken: string): string | null {
+    const key = fingerprint(entraToken);
+    const override = tenantOverride.get(key);
+    if (override) return override;
+    return credentialsCache.get(key)?.preferredTenant ?? null;
+}
+
+// ── Public: token extraction from MCP context ─────────────────────────────────
+
+/**
+ * Extracts the user's Entra Bearer token from the MCP trigger context.
+ *
+ * Azure Foundry forwards the user's Entra ID token via the HTTP Authorization
+ * header of the MCP WebHook request. The Azure Functions MCP host surfaces
+ * this through multiple paths — we check all known paths for compatibility:
+ *
+ *   1. toolInvocationContext.transport.headers   (MCP SDK path)
+ *   2. triggerMetadata.transport.headers         (serialized ToolInvocationContext)
+ *   3. triggerMetadata.headers                   (flat headers object)
+ *   4. triggerMetadata.*                         (top-level flat fields)
+ */
+export function extractUserToken(
+    triggerMetadata: Record<string, any>,
+    toolInvocationContext?: any
+): string | null {
+    const AUTH_FIELDS = [
+        "authorization", "Authorization",
+        "x-ms-token-aad-access-token", "X-MS-TOKEN-AAD-ACCESS-TOKEN",
+        "bearer_token", "access_token",
     ];
 
-    const extractBearer = (value: string): string => {
-        return value.startsWith('Bearer ') ? value.substring(7) : value;
+    const stripBearer = (v: string) =>
+        v.startsWith("Bearer ") ? v.substring(7) : v;
+
+    const tryHeaders = (headers: Record<string, any>, source: string): string | null => {
+        for (const field of AUTH_FIELDS) {
+            const val = headers[field];
+            if (val && typeof val === "string") {
+                console.log(`[TokenManager] Entra token found in ${source}.${field}`);
+                return stripBearer(val);
+            }
+        }
+        // Case-insensitive fallback
+        for (const [k, v] of Object.entries(headers)) {
+            if (typeof v === "string" && k.toLowerCase() === "authorization") {
+                console.log(`[TokenManager] Entra token found in ${source}['${k}'] (case-insensitive)`);
+                return stripBearer(v);
+            }
+        }
+        return null;
     };
 
-    // 1. Check toolInvocationContext.transport.headers (MCP extension path)
-    if (toolInvocationContext) {
-        const transport = toolInvocationContext?.transport;
-        if (transport?.headers && typeof transport.headers === 'object') {
-            for (const field of authFields) {
-                const value = transport.headers[field];
-                if (value && typeof value === 'string') {
-                    console.log(`[TokenManager] Found token in toolInvocationContext.transport.headers.${field}`);
-                    return extractBearer(value);
-                }
-            }
-            // Case-insensitive scan of transport headers
-            for (const [key, val] of Object.entries(transport.headers)) {
-                if (typeof val === 'string' && key.toLowerCase() === 'authorization') {
-                    console.log(`[TokenManager] Found token in transport.headers['${key}'] (scan)`);
-                    return extractBearer(val);
-                }
-            }
-        }
+    // 1. toolInvocationContext.transport.headers  (MCP SDK path)
+    const ticTransport = toolInvocationContext?.transport;
+    if (ticTransport?.headers && typeof ticTransport.headers === "object") {
+        const t = tryHeaders(ticTransport.headers, "toolInvocationContext.transport.headers");
+        if (t) return t;
     }
 
-    // 2. Check triggerMetadata (various possible locations)
+    // 2. triggerMetadata.transport.headers
+    const mdTransport = triggerMetadata?.transport;
+    if (mdTransport?.headers && typeof mdTransport.headers === "object") {
+        const t = tryHeaders(mdTransport.headers, "triggerMetadata.transport.headers");
+        if (t) return t;
+    }
+
+    // 3. triggerMetadata.headers
+    if (triggerMetadata?.headers && typeof triggerMetadata.headers === "object") {
+        const t = tryHeaders(triggerMetadata.headers, "triggerMetadata.headers");
+        if (t) return t;
+    }
+
+    // 4. Top-level triggerMetadata fields
     if (triggerMetadata) {
-        // 2a. Check transport.headers inside triggerMetadata (serialized from ToolInvocationContext)
-        const transport = triggerMetadata.transport;
-        if (transport?.headers && typeof transport.headers === 'object') {
-            for (const field of authFields) {
-                const value = transport.headers[field];
-                if (value && typeof value === 'string') {
-                    console.log(`[TokenManager] Found token in triggerMetadata.transport.headers.${field}`);
-                    return extractBearer(value);
-                }
-            }
-        }
-
-        // 2b. Check flat triggerMetadata fields
-        for (const field of authFields) {
-            const value = triggerMetadata[field];
-            if (value && typeof value === 'string') {
-                console.log(`[TokenManager] Found token in triggerMetadata.${field}`);
-                return extractBearer(value);
-            }
-        }
-
-        // 2c. Check nested headers object
-        if (triggerMetadata.headers && typeof triggerMetadata.headers === 'object') {
-            for (const field of authFields) {
-                const value = triggerMetadata.headers[field];
-                if (value && typeof value === 'string') {
-                    console.log(`[TokenManager] Found token in triggerMetadata.headers.${field}`);
-                    return extractBearer(value);
-                }
+        for (const field of AUTH_FIELDS) {
+            const val = triggerMetadata[field];
+            if (val && typeof val === "string") {
+                console.log(`[TokenManager] Entra token found in triggerMetadata.${field}`);
+                return stripBearer(val);
             }
         }
     }
 
-    console.warn("[TokenManager] No Entra token found in any known location");
+    console.warn("[TokenManager] ⚠️  No Entra token found in any known location — ensure Foundry OAuth passthrough is configured.");
     return null;
 }
 
-/**
- * Diagnostic function: runs the full auth flow and returns detailed debug info.
- * Used by the debug_auth action to troubleshoot authentication issues.
- */
-export async function debugAuth(userEntraToken: string | null): Promise<Record<string, any>> {
-    const diag: Record<string, any> = {
-        timestamp: new Date().toISOString(),
-        apiUrl: API_URL,
-        saasUrl: SAAS_URL,
-        hasStaticToken: !!STATIC_TOKEN,
-        userTokenFound: !!userEntraToken,
-        userTokenLength: userEntraToken?.length ?? 0,
-    };
-
-    if (!userEntraToken) {
-        diag.error = "No user Entra token found in request";
-        return diag;
-    }
-
-    // Step 1: Call saas.prodago.com
-    try {
-        const saasResponse = await fetch(SAAS_URL, {
-            method: "GET",
-            headers: {
-                "Authorization": `Bearer ${userEntraToken}`,
-                "Accept": "application/json",
-            },
-            redirect: "manual",
-        });
-
-        diag.saasStatus = saasResponse.status;
-        diag.saasStatusText = saasResponse.statusText;
-
-        // Dump all response headers
-        const saasHeaders: Record<string, string> = {};
-        saasResponse.headers.forEach((value, key) => {
-            saasHeaders[key] = key.toLowerCase().includes('auth') ? `${value.substring(0, 20)}...` : value;
-        });
-        diag.saasResponseHeaders = saasHeaders;
-
-        const authHeader = saasResponse.headers.get("Authorization");
-        diag.saasHasAuthHeader = !!authHeader;
-
-        const saasPreferredTenant = saasResponse.headers.get("preferred-tenant");
-        diag.saasPreferredTenant = saasPreferredTenant || "NONE";
-
-        if (!authHeader) {
-            diag.error = "saas.prodago.com did not return Authorization header";
-            const bodyText = await saasResponse.text().catch(() => '');
-            diag.saasBody = bodyText.substring(0, 500);
-            return diag;
-        }
-
-        const prodagoToken = authHeader.startsWith("Bearer ") ? authHeader.substring(7) : authHeader;
-        diag.prodagoTokenLength = prodagoToken.length;
-
-        // Step 2: Call /api/User/userTenants
-        try {
-            const tenantHeaders: Record<string, string> = {
-                "Authorization": `Bearer ${prodagoToken}`,
-                "Accept": "application/json",
-            };
-            if (saasPreferredTenant) {
-                tenantHeaders["preferred-tenant"] = saasPreferredTenant;
-            }
-
-            const tenantsResponse = await fetch(`${API_URL}/User/userTenants`, {
-                method: "GET",
-                headers: tenantHeaders,
-            });
-
-            diag.userTenantsStatus = tenantsResponse.status;
-            diag.userTenantsStatusText = tenantsResponse.statusText;
-
-            if (tenantsResponse.ok) {
-                const tenantsData = await tenantsResponse.json() as any;
-                diag.userTenantsRawResponse = JSON.stringify(tenantsData).substring(0, 1000);
-                const tenants = Array.isArray(tenantsData) ? tenantsData : tenantsData?.tenants;
-                diag.tenantsCount = tenants?.length ?? 0;
-                if (tenants && tenants.length > 0) {
-                    diag.tenantsList = tenants.map((t: any) => ({
-                        tenantId: t.tenantId || t.id || t.TenantId,
-                        name: t.name || t.tenantName || t.TenantName,
-                        ...t,
-                    }));
-                    diag.resolvedTenant = tenants[0].tenantId || tenants[0].id || tenants[0].TenantId;
-                }
-            } else {
-                const errorBody = await tenantsResponse.text().catch(() => '');
-                diag.userTenantsError = errorBody.substring(0, 500);
-            }
-        } catch (err: any) {
-            diag.userTenantsException = err.message;
-        }
-
-        // Step 3: Try calling /projects with the resolved tenant
-        const effectiveTenant = diag.resolvedTenant || saasPreferredTenant;
-        diag.effectiveTenant = effectiveTenant || "NONE";
-
-        try {
-            const projectHeaders: Record<string, string> = {
-                "Authorization": `Bearer ${prodagoToken}`,
-                "Accept": "application/json",
-                "Accept-Language": "en",
-            };
-            if (effectiveTenant) {
-                projectHeaders["preferred-tenant"] = effectiveTenant;
-            }
-
-            const projectsResponse = await fetch(`${API_URL}/projects`, {
-                method: "GET",
-                headers: projectHeaders,
-            });
-
-            diag.projectsStatus = projectsResponse.status;
-            diag.projectsStatusText = projectsResponse.statusText;
-
-            if (projectsResponse.ok) {
-                const projectsData = await projectsResponse.json() as any;
-                const projects = Array.isArray(projectsData) ? projectsData : [];
-                diag.projectsCount = projects.length;
-                if (projects.length > 0) {
-                    diag.firstProject = { id: projects[0].id, name: projects[0].name };
-                }
-            } else {
-                const errorBody = await projectsResponse.text().catch(() => '');
-                diag.projectsError = errorBody.substring(0, 500);
-            }
-        } catch (err: any) {
-            diag.projectsException = err.message;
-        }
-
-    } catch (err: any) {
-        diag.saasException = err.message;
-    }
-
-    return diag;
-}
+// ── Public: main API fetch ────────────────────────────────────────────────────
 
 /**
- * Options for fetchProdagoAPI beyond GET requests.
- */
-export interface FetchOptions {
-    method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
-    body?: unknown;
-}
-
-/**
- * Fetches data from the Prodago API.
- * If a user Entra token is provided, exchanges it for Prodago credentials via saas.prodago.com.
- * The preferred-tenant header from saas is forwarded to all API calls.
- * Otherwise falls back to the static PRODAGO_API_TOKEN.
+ * Performs an authenticated request to the Prodago API.
  *
- * Supports all HTTP methods (GET, POST, PUT, DELETE) via the options parameter.
+ * Auth resolution (in order):
+ *   1. User Entra token → exchanged for Prodago token + tenant via saas.prodago.com
+ *   2. PRODAGO_API_TOKEN env var (static token for dev / CI)
+ *
+ * The preferred-tenant header is sent automatically on every request.
+ * Users can switch tenant for their session via the set_preferred_tenant action
+ * (which calls switchTenant() above).
+ *
+ * On 401, the cached credentials for that user are invalidated so the next call
+ * will re-exchange the Entra token.
  */
 export async function fetchProdagoAPI<T>(
     endpoint: string,
-    userEntraToken?: string | null,
+    entraToken?: string | null,
     options?: FetchOptions,
 ): Promise<T> {
-    let token: string;
+    let prodagoToken: string;
     let preferredTenant: string | null = null;
 
-    if (userEntraToken) {
-        // Exchange user's Entra token for Prodago credentials (token + preferred-tenant)
-        const credentials = await exchangeForProdagoCredentials(userEntraToken);
-        token = credentials.token;
-        preferredTenant = credentials.preferredTenant;
-    } else if (STATIC_TOKEN) {
-        // Fallback to static token (dev/testing)
-        console.log("[TokenManager] Using static PRODAGO_API_TOKEN (no user token available)");
-        token = STATIC_TOKEN;
+    if (entraToken) {
+        // ── Path 1: full OAuth passthrough (production) ───────────────────
+        const creds = await exchangeForProdagoCredentials(entraToken);
+        prodagoToken = creds.prodagoToken;
 
-        // Resolve preferred-tenant for static token usage
+        // Check for tenant override (set via set_preferred_tenant action)
+        const key = fingerprint(entraToken);
+        preferredTenant = tenantOverride.get(key) ?? creds.preferredTenant;
+
+    } else if (STATIC_TOKEN) {
+        // ── Path 2: static token fallback (dev / CI) ─────────────────────
+        console.log("[TokenManager] Using static PRODAGO_API_TOKEN");
+        prodagoToken = STATIC_TOKEN;
         preferredTenant = process.env.PRODAGO_DEFAULT_TENANT || null;
-        if (preferredTenant) {
-            console.log(`[TokenManager] Using PRODAGO_DEFAULT_TENANT: ${preferredTenant}`);
-        } else {
-            // Try saas.prodago.com with static token to get tenant
+
+        if (!preferredTenant) {
+            // Try to resolve tenant from saas.prodago.com
             try {
-                const saasRes = await fetch(SAAS_URL, {
-                    method: "GET",
+                const r1 = await fetch(SAAS_URL, {
                     headers: { "Authorization": `Bearer ${STATIC_TOKEN}`, "Accept": "application/json" },
                     redirect: "manual",
                 });
-                preferredTenant = saasRes.headers.get("preferred-tenant");
+                preferredTenant = r1.headers.get("preferred-tenant");
                 if (!preferredTenant) {
-                    const followRes = await fetch(SAAS_URL, {
-                        method: "GET",
+                    const r2 = await fetch(SAAS_URL, {
                         headers: { "Authorization": `Bearer ${STATIC_TOKEN}`, "Accept": "application/json" },
                     });
-                    preferredTenant = followRes.headers.get("preferred-tenant");
+                    preferredTenant = r2.headers.get("preferred-tenant");
                     if (!preferredTenant) {
-                        const body = await followRes.text().catch(() => '');
+                        const body = await r2.text().catch(() => "");
                         try {
                             const data = JSON.parse(body);
-                            const tenants = Array.isArray(data) ? data : data?.tenants || data?.userTenants || [];
-                            if (tenants.length > 0) {
-                                preferredTenant = tenants[0].tenantName || tenants[0].name || tenants[0].tenantId || tenants[0].id;
-                            }
+                            const tenants: any[] = Array.isArray(data)
+                                ? data
+                                : data?.tenants ?? data?.userTenants ?? [];
+                            preferredTenant = tenants[0]?.tenantName ?? tenants[0]?.name ?? null;
                         } catch { /* not JSON */ }
                     }
                 }
                 if (preferredTenant) {
-                    console.log(`[TokenManager] Got tenant from saas (static token): ${preferredTenant}`);
-                } else {
-                    console.warn("[TokenManager] Could not resolve tenant from saas with static token");
+                    console.log(`[TokenManager] Resolved tenant from saas (static token): ${preferredTenant}`);
                 }
             } catch (err: any) {
                 console.warn(`[TokenManager] saas call with static token failed: ${err.message}`);
@@ -476,61 +349,163 @@ export async function fetchProdagoAPI<T>(
         }
     } else {
         throw new Error(
-            "No user token available and PRODAGO_API_TOKEN not configured. " +
-            "The Foundry Agent must forward the user's Entra token to the MCP server."
+            "No authentication token available. The Azure Foundry Agent must be configured with " +
+            "OAuth passthrough (project_connection_id) so the user's Entra token is forwarded to the MCP server."
         );
     }
 
-    const method = options?.method || 'GET';
-    const url = `${API_URL}${endpoint}`;
-    const apiHeaders: Record<string, string> = {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json',
-        'Accept-Language': 'en',
+    // ── Build request ─────────────────────────────────────────────────────
+    const method = options?.method ?? "GET";
+    const url    = `${API_URL}${endpoint}`;
+
+    const headers: Record<string, string> = {
+        "Authorization": `Bearer ${prodagoToken}`,
+        "Accept":         "application/json",
+        "Accept-Language": "en",
     };
 
     if (preferredTenant) {
-        apiHeaders['preferred-tenant'] = preferredTenant;
+        headers["preferred-tenant"] = preferredTenant;
     }
 
-    // Add Content-Type for requests with a body
     if (options?.body !== undefined) {
-        apiHeaders['Content-Type'] = 'application/json';
+        headers["Content-Type"] = "application/json";
     }
 
-    const fetchInit: RequestInit = {
+    console.log(`[API] ${method} ${endpoint} | tenant: ${preferredTenant ?? "NONE"}`);
+
+    const response = await fetch(url, {
         method,
-        headers: apiHeaders,
-    };
+        headers,
+        body: options?.body !== undefined ? JSON.stringify(options.body) : undefined,
+    });
 
-    if (options?.body !== undefined) {
-        fetchInit.body = JSON.stringify(options.body);
-    }
-
-    const response = await fetch(url, fetchInit);
-
+    // ── Handle errors ─────────────────────────────────────────────────────
     if (!response.ok) {
-        const errorBody = await response.text().catch(() => '');
-        // If 401, invalidate cache for this token
-        if (response.status === 401 && userEntraToken) {
-            const cacheKey = hashToken(userEntraToken);
-            credentialsCache.delete(cacheKey);
-            console.warn(`[TokenManager] Got 401 — invalidated cache. Body: ${errorBody.substring(0, 300)}`);
+        const errorBody = await response.text().catch(() => "");
+
+        if (response.status === 401 && entraToken) {
+            // Invalidate cached credentials so the next call re-exchanges the token
+            const key = fingerprint(entraToken);
+            credentialsCache.delete(key);
+            tenantOverride.delete(key);
+            console.warn(`[TokenManager] 401 — credentials invalidated for re-exchange. Body: ${errorBody.substring(0, 300)}`);
         }
-        console.error(`[API Error] ${method} ${endpoint} → ${response.status} | tenant: ${preferredTenant || 'NONE'} | body: ${errorBody.substring(0, 300)}`);
-        throw new Error(`Prodago API error: ${response.status} ${response.statusText} for ${method} ${endpoint}. Tenant: ${preferredTenant || 'NONE'}`);
+
+        console.error(`[API Error] ${method} ${endpoint} → ${response.status} | tenant: ${preferredTenant ?? "NONE"} | ${errorBody.substring(0, 300)}`);
+        throw new Error(
+            `Prodago API error ${response.status} ${response.statusText} on ${method} ${endpoint}. ` +
+            `Tenant: ${preferredTenant ?? "NONE"}`
+        );
     }
 
-    // Handle 204 No Content responses (common for PUT/DELETE)
-    if (response.status === 204) {
-        return null as T;
-    }
+    // ── 204 No Content ────────────────────────────────────────────────────
+    if (response.status === 204) return null as T;
 
-    // Handle empty responses
     const text = await response.text();
-    if (!text) {
-        return null as T;
-    }
+    if (!text) return null as T;
 
     return JSON.parse(text) as T;
+}
+
+// ── Public: diagnostics ───────────────────────────────────────────────────────
+
+/**
+ * Runs the full auth exchange and returns a diagnostic snapshot.
+ * Called by the debug_auth action. Never exposed directly to the end user.
+ */
+export async function debugAuth(entraToken: string | null): Promise<Record<string, any>> {
+    const diag: Record<string, any> = {
+        timestamp:      new Date().toISOString(),
+        apiUrl:         API_URL,
+        saasUrl:        SAAS_URL,
+        hasStaticToken: !!STATIC_TOKEN,
+        entraTokenFound: !!entraToken,
+        entraTokenLength: entraToken?.length ?? 0,
+    };
+
+    if (!entraToken) {
+        diag.error = "No Entra token found. Verify Foundry OAuth passthrough is configured (project_connection_id).";
+        return diag;
+    }
+
+    try {
+        // Step 1: saas.prodago.com (manual redirect)
+        const saasRes = await fetch(SAAS_URL, {
+            method: "GET",
+            headers: {
+                "Authorization": `Bearer ${entraToken}`,
+                "Accept": "application/json",
+            },
+            redirect: "manual",
+        });
+        diag.saasStatus = saasRes.status;
+
+        const saasHeaders: Record<string, string> = {};
+        saasRes.headers.forEach((v, k) => {
+            saasHeaders[k] = k.toLowerCase().includes("auth")
+                ? `${v.substring(0, 20)}...(len:${v.length})`
+                : v;
+        });
+        diag.saasResponseHeaders = saasHeaders;
+
+        const authHeader = saasRes.headers.get("Authorization");
+        diag.saasHasAuthHeader = !!authHeader;
+        diag.saasPreferredTenant = saasRes.headers.get("preferred-tenant") ?? "NONE";
+
+        if (!authHeader) {
+            diag.error = "saas.prodago.com did not return an Authorization header";
+            diag.saasBody = (await saasRes.text().catch(() => "")).substring(0, 500);
+            return diag;
+        }
+
+        const prodagoToken = authHeader.startsWith("Bearer ") ? authHeader.substring(7) : authHeader;
+        diag.prodagoTokenLength = prodagoToken.length;
+
+        // Step 2: /User/userTenants
+        const tenantRes = await fetch(`${API_URL}/User/userTenants`, {
+            headers: {
+                "Authorization": `Bearer ${prodagoToken}`,
+                "Accept": "application/json",
+                ...(diag.saasPreferredTenant !== "NONE"
+                    ? { "preferred-tenant": diag.saasPreferredTenant }
+                    : {}),
+            },
+        });
+        diag.userTenantsStatus = tenantRes.status;
+        if (tenantRes.ok) {
+            const data = await tenantRes.json() as any;
+            const tenants: any[] = Array.isArray(data) ? data : data?.tenants ?? [];
+            diag.tenantsCount = tenants.length;
+            diag.tenantsList = tenants.map((t: any) => ({
+                id: t.tenantId ?? t.id ?? t.TenantId,
+                name: t.name ?? t.tenantName ?? t.TenantName,
+            }));
+        } else {
+            diag.userTenantsError = (await tenantRes.text().catch(() => "")).substring(0, 500);
+        }
+
+        // Step 3: /projects quick smoke test
+        const tenant = diag.saasPreferredTenant !== "NONE" ? diag.saasPreferredTenant : null;
+        const projRes = await fetch(`${API_URL}/projects`, {
+            headers: {
+                "Authorization": `Bearer ${prodagoToken}`,
+                "Accept": "application/json",
+                "Accept-Language": "en",
+                ...(tenant ? { "preferred-tenant": tenant } : {}),
+            },
+        });
+        diag.projectsStatus = projRes.status;
+        if (projRes.ok) {
+            const projects = await projRes.json() as any[];
+            diag.projectsCount = Array.isArray(projects) ? projects.length : 0;
+        } else {
+            diag.projectsError = (await projRes.text().catch(() => "")).substring(0, 300);
+        }
+
+    } catch (err: any) {
+        diag.exception = err.message;
+    }
+
+    return diag;
 }
